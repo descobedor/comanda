@@ -6,7 +6,7 @@ import "./App.css";
 
 const API_URL = "https://signaling-server-z9az.onrender.com";
 const WS_URL = "wss://signaling-server-z9az.onrender.com";
-const APP_URL = "https://comanda-client.vercel.app";
+const APP_URL = "https://comanda-client-six.vercel.app";
 
 function App() {
   const [tables, setTables] = useState([]);
