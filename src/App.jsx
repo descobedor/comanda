@@ -1,12 +1,13 @@
 import { useEffect, useState, useRef } from "react";
 import axios from "axios";
 import { QRCodeCanvas } from "qrcode.react";
-import { FaConciergeBell, FaFileInvoiceDollar, FaTimesCircle } from "react-icons/fa";
+import { FaConciergeBell, FaFileInvoiceDollar } from "react-icons/fa";
 import "./App.css";
 
 const API_URL = "https://signaling-server-z9az.onrender.com";
 const WS_URL = "wss://signaling-server-z9az.onrender.com";
 const APP_URL = "https://comanda-client-six.vercel.app";
+
 
 function App() {
   const [tables, setTables] = useState([]);
@@ -15,34 +16,27 @@ function App() {
   const sockets = useRef({});
   const reconnectTimers = useRef({});
 
-  // 🔄 Restaurar mesas desde localStorage al montar
-  // 🔄 Restaurar mesas desde localStorage al montar
-useEffect(() => {
-  const saved = localStorage.getItem("tables");
-  if (saved) {
-    const parsed = JSON.parse(saved);
-
-    // Evitar duplicados: setear todas de golpe
-    setTables(parsed.map(t => ({
-      uuid: t.uuid,
-      alias: t.alias,
-      history: [],
-      hasPending: false,
-      connected: false
-    })));
-
-    // Conectar a cada mesa
-    parsed.forEach(t => {
-      connectTo({ uuid: t.uuid, alias: t.alias, history: [], hasPending: false, connected: false });
-    });
-  }
-}, []);
-
+  // 🔹 Restaurar mesas al recargar
+  useEffect(() => {
+    const saved = localStorage.getItem("tables");
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      setTables(
+        parsed.map((t) => ({
+          uuid: t.uuid,
+          alias: t.alias,
+          history: [],
+          hasPending: false,
+          connected: false,
+        }))
+      );
+      parsed.forEach((t) => connectTo(t));
+    }
+  }, []);
 
   const generateTable = async () => {
     const alias = prompt("Introduce un alias para la mesa:");
     if (!alias) return;
-
     if (tables.some((t) => t.alias.toLowerCase() === alias.toLowerCase())) {
       alert("Ya existe una mesa con ese alias.");
       return;
@@ -53,7 +47,6 @@ useEffect(() => {
         `${API_URL}/new?alias=${encodeURIComponent(alias)}`
       );
       const { uuid, alias: confirmedAlias } = data;
-
       const newTable = {
         uuid,
         alias: confirmedAlias,
@@ -71,11 +64,6 @@ useEffect(() => {
         return updated;
       });
 
-      if (tables.some(t => t.uuid === uuid)) {
-      console.log("Mesa ya existe, no se duplica");
-      return;
-    }
-
       connectTo(newTable);
     } catch (err) {
       console.error("Error creando mesa:", err);
@@ -83,17 +71,6 @@ useEffect(() => {
   };
 
   const connectTo = (table) => {
-    try {
-      const prev = sockets.current[table.uuid];
-      if (
-        prev &&
-        (prev.readyState === WebSocket.OPEN ||
-          prev.readyState === WebSocket.CONNECTING)
-      ) {
-        prev.close();
-      }
-    } catch {}
-
     const socket = new WebSocket(`${WS_URL}/${table.uuid}?role=waiter`);
     sockets.current[table.uuid] = socket;
 
@@ -115,23 +92,12 @@ useEffect(() => {
           t.uuid === table.uuid ? { ...t, connected: false } : t
         )
       );
-
-      // Cierre definitivo → no reconectar
-      const reason = (evt.reason || "").toLowerCase();
-      const definitive =
-        evt.code === 4000 ||
-        reason.includes("mesa cerrada por camarero") ||
-        reason.includes("mesa cerrada por falta de camarero") ||
-        reason.includes("no existe");
-
-      if (definitive) return;
-
-      // Evitar múltiples timers
-      if (reconnectTimers.current[table.uuid]) return;
-      reconnectTimers.current[table.uuid] = setTimeout(() => {
-        reconnectTimers.current[table.uuid] = null;
-        connectTo(table);
-      }, 5000);
+      if (!reconnectTimers.current[table.uuid]) {
+        reconnectTimers.current[table.uuid] = setTimeout(() => {
+          reconnectTimers.current[table.uuid] = null;
+          connectTo(table);
+        }, 5000);
+      }
     };
 
     socket.onmessage = (event) => {
@@ -147,21 +113,25 @@ useEffect(() => {
           } else if (msg.type === "message") {
             updatedHistory.push(msg.data);
             notify(table.alias, msg.data);
+
             setQueue((prevQ) =>
               prevQ.some((m) => m.id === msg.data.id)
                 ? prevQ
                 : [...prevQ, { ...msg.data, alias: table.alias }]
             );
-          } else if (msg.type === "confirmation" || msg.type === "cancellation") {
+          } else if (
+            msg.type === "confirmation" ||
+            msg.type === "cancellation"
+          ) {
             updatedHistory = updatedHistory.map((m) =>
               m.id === msg.data.id
-                ? { ...m, status: msg.data.status, reason: msg.data.reason }
+                ? { ...m, status: msg.data.status }
                 : m
             );
             setQueue((prevQ) =>
               prevQ.map((m) =>
                 m.id === msg.data.id
-                  ? { ...m, status: msg.data.status, reason: msg.data.reason }
+                  ? { ...m, status: msg.data.status }
                   : m
               )
             );
@@ -171,6 +141,17 @@ useEffect(() => {
           return { ...t, history: updatedHistory, hasPending };
         })
       );
+    };
+
+    // 🔹 Heartbeat
+    const interval = setInterval(() => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "ping" }));
+      }
+    }, 20000);
+
+    socket.onclose = () => {
+      clearInterval(interval);
     };
   };
 
@@ -184,7 +165,6 @@ useEffect(() => {
       sockets.current[uuid].close();
       delete sockets.current[uuid];
     }
-    const alias = tables.find((t) => t.uuid === uuid)?.alias;
     setTables((prev) => {
       const updated = prev.filter((t) => t.uuid !== uuid);
       localStorage.setItem(
@@ -193,21 +173,22 @@ useEffect(() => {
       );
       return updated;
     });
-    setQueue((prev) => prev.filter((m) => m.alias !== alias));
+    setQueue((prev) =>
+      prev.filter((m) => m.alias !== tables.find((t) => t.uuid === uuid)?.alias)
+    );
   };
 
   const notify = (alias, msg) => {
     const audio = new Audio("/ding.mp3");
     audio.play().catch(() => {});
-    if (navigator.vibrate) navigator.vibrate(300);
+    if (navigator.vibrate) navigator.vibrate(200);
     console.log(`🔔 Nueva orden en ${alias}: ${msg.action}`);
   };
 
   const renderIcon = (action, status) => {
     let icon;
-    if (action === "service") icon = <FaConciergeBell size={24} />;
-    if (action === "bill") icon = <FaFileInvoiceDollar size={24} />;
-    if (action === "cancel") icon = <FaTimesCircle size={24} />;
+    if (action === "service") icon = <FaConciergeBell size={20} />;
+    if (action === "bill") icon = <FaFileInvoiceDollar size={20} />;
 
     let color = "#333";
     if (status === "pending") color = "#ffc107";
@@ -221,16 +202,9 @@ useEffect(() => {
     return (
       <span style={{ color, display: "flex", alignItems: "center", gap: "6px" }}>
         {icon}
-        <span>{getLabel(action)} — {labelStatus}</span>
+        <span>{labelStatus}</span>
       </span>
     );
-  };
-
-  const getLabel = (action) => {
-    if (action === "service") return "Servicio del restaurante";
-    if (action === "bill") return "Cuenta";
-    if (action === "cancel") return "Cancelado";
-    return "";
   };
 
   const sortedTables = [...tables].sort((a, b) => {
@@ -256,7 +230,10 @@ useEffect(() => {
       ) : (
         <div className="tables-container">
           {sortedTables.map((t) => (
-            <div key={t.uuid} className={`table-card ${t.hasPending ? "pending" : ""}`}>
+            <div
+              key={t.uuid}
+              className={`table-card ${t.hasPending ? "pending" : ""}`}
+            >
               <div className="card-header">
                 <h3>
                   {t.alias}
@@ -266,15 +243,18 @@ useEffect(() => {
                     </span>
                   )}
                 </h3>
-                <span className={`status ${t.connected ? "online" : "offline"}`}>
-                  {t.connected ? "🟢 Conectada" : "🔴 Desconectada"}
-                </span>
-                <button className="lock-table-btn" onClick={() => closeTable(t.uuid)}>
+                <button
+                  className="lock-table-btn"
+                  onClick={() => closeTable(t.uuid)}
+                >
                   🔒
                 </button>
               </div>
 
-              <div className="qr-container" onClick={() => setQrModal(t.uuid)}>
+              <div
+                className="qr-container"
+                onClick={() => setQrModal(t.uuid)}
+              >
                 <QRCodeCanvas
                   value={`${APP_URL}/join/${t.uuid}`}
                   size={100}
@@ -286,7 +266,11 @@ useEffect(() => {
               </div>
 
               {t.history.length > 0 && (
-                <div className={`last-msg ${t.history[t.history.length - 1].status}`}>
+                <div
+                  className={`last-msg ${
+                    t.history[t.history.length - 1].status
+                  }`}
+                >
                   <span>
                     {renderIcon(
                       t.history[t.history.length - 1].action,
@@ -297,7 +281,10 @@ useEffect(() => {
                     {t.history[t.history.length - 1].status === "pending" ? (
                       <button
                         onClick={() =>
-                          confirmOrder(t.uuid, t.history[t.history.length - 1].id)
+                          confirmOrder(
+                            t.uuid,
+                            t.history[t.history.length - 1].id
+                          )
                         }
                       >
                         ✅
@@ -328,7 +315,10 @@ useEffect(() => {
 
       {qrModal && (
         <div className="qr-modal" onClick={() => setQrModal(null)}>
-          <div className="qr-modal-content" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="qr-modal-content"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2>Escanea este QR</h2>
             <QRCodeCanvas
               value={`${APP_URL}/join/${qrModal}`}
