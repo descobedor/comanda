@@ -201,3 +201,23 @@
   margin-bottom: 20px;
   font-size: 18px;
 }
+/* Estado de conexión de mesas */
+.status {
+  margin-left: 10px;
+  font-size: 14px;
+  font-weight: bold;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.status.online {
+  color: #155724;
+  background: #d4edda;
+  border: 1px solid #28a745;
+}
+
+.status.offline {
+  color: #721c24;
+  background: #f8d7da;
+  border: 1px solid #dc3545;
+}
