@@ -13,6 +13,31 @@ function App() {
   const [queue, setQueue] = useState([]);
   const [qrModal, setQrModal] = useState(null);
   const sockets = useRef({});
+  const reconnectTimers = useRef({});
+
+  // 🔄 Restaurar mesas desde localStorage al montar
+  // 🔄 Restaurar mesas desde localStorage al montar
+useEffect(() => {
+  const saved = localStorage.getItem("tables");
+  if (saved) {
+    const parsed = JSON.parse(saved);
+
+    // Evitar duplicados: setear todas de golpe
+    setTables(parsed.map(t => ({
+      uuid: t.uuid,
+      alias: t.alias,
+      history: [],
+      hasPending: false,
+      connected: false
+    })));
+
+    // Conectar a cada mesa
+    parsed.forEach(t => {
+      connectTo({ uuid: t.uuid, alias: t.alias, history: [], hasPending: false, connected: false });
+    });
+  }
+}, []);
+
 
   const generateTable = async () => {
     const alias = prompt("Introduce un alias para la mesa:");
@@ -24,11 +49,32 @@ function App() {
     }
 
     try {
-      const { data } = await axios.get(`${API_URL}/new?alias=${encodeURIComponent(alias)}`);
+      const { data } = await axios.get(
+        `${API_URL}/new?alias=${encodeURIComponent(alias)}`
+      );
       const { uuid, alias: confirmedAlias } = data;
 
-      const newTable = { uuid, alias: confirmedAlias, history: [], hasPending: false, connected: false };
-      setTables((prev) => [...prev, newTable]);
+      const newTable = {
+        uuid,
+        alias: confirmedAlias,
+        history: [],
+        hasPending: false,
+        connected: false,
+      };
+
+      setTables((prev) => {
+        const updated = [...prev, newTable];
+        localStorage.setItem(
+          "tables",
+          JSON.stringify(updated.map((t) => ({ uuid: t.uuid, alias: t.alias })))
+        );
+        return updated;
+      });
+
+      if (tables.some(t => t.uuid === uuid)) {
+      console.log("Mesa ya existe, no se duplica");
+      return;
+    }
 
       connectTo(newTable);
     } catch (err) {
@@ -36,83 +82,97 @@ function App() {
     }
   };
 
-  const reconnectTimers = useRef({});
+  const connectTo = (table) => {
+    try {
+      const prev = sockets.current[table.uuid];
+      if (
+        prev &&
+        (prev.readyState === WebSocket.OPEN ||
+          prev.readyState === WebSocket.CONNECTING)
+      ) {
+        prev.close();
+      }
+    } catch {}
 
-const connectTo = (table) => {
-  // Si ya hay un socket “vivo”, ciérralo antes
-  try {
-    const prev = sockets.current[table.uuid];
-    if (prev && (prev.readyState === WebSocket.OPEN || prev.readyState === WebSocket.CONNECTING)) {
-      prev.close();
-    }
-  } catch {}
+    const socket = new WebSocket(`${WS_URL}/${table.uuid}?role=waiter`);
+    sockets.current[table.uuid] = socket;
 
-  const socket = new WebSocket(`${WS_URL}/${table.uuid}?role=waiter`);
-  sockets.current[table.uuid] = socket;
+    socket.onopen = () => {
+      console.log(`✅ Mesa ${table.alias} conectada`);
+      setTables((prev) =>
+        prev.map((t) =>
+          t.uuid === table.uuid ? { ...t, connected: true } : t
+        )
+      );
+    };
 
-  socket.onopen = () => {
-    console.log(`✅ Mesa ${table.alias} conectada`);
-    setTables((prev) => prev.map((t) => (t.uuid === table.uuid ? { ...t, connected: true } : t)));
+    socket.onclose = (evt) => {
+      console.log(
+        `⚠️ Mesa ${table.alias} desconectada (code=${evt.code}, reason=${evt.reason})`
+      );
+      setTables((prev) =>
+        prev.map((t) =>
+          t.uuid === table.uuid ? { ...t, connected: false } : t
+        )
+      );
+
+      // Cierre definitivo → no reconectar
+      const reason = (evt.reason || "").toLowerCase();
+      const definitive =
+        evt.code === 4000 ||
+        reason.includes("mesa cerrada por camarero") ||
+        reason.includes("mesa cerrada por falta de camarero") ||
+        reason.includes("no existe");
+
+      if (definitive) return;
+
+      // Evitar múltiples timers
+      if (reconnectTimers.current[table.uuid]) return;
+      reconnectTimers.current[table.uuid] = setTimeout(() => {
+        reconnectTimers.current[table.uuid] = null;
+        connectTo(table);
+      }, 5000);
+    };
+
+    socket.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+
+      setTables((prev) =>
+        prev.map((t) => {
+          if (t.uuid !== table.uuid) return t;
+          let updatedHistory = [...t.history];
+
+          if (msg.type === "history") {
+            updatedHistory = msg.data;
+          } else if (msg.type === "message") {
+            updatedHistory.push(msg.data);
+            notify(table.alias, msg.data);
+            setQueue((prevQ) =>
+              prevQ.some((m) => m.id === msg.data.id)
+                ? prevQ
+                : [...prevQ, { ...msg.data, alias: table.alias }]
+            );
+          } else if (msg.type === "confirmation" || msg.type === "cancellation") {
+            updatedHistory = updatedHistory.map((m) =>
+              m.id === msg.data.id
+                ? { ...m, status: msg.data.status, reason: msg.data.reason }
+                : m
+            );
+            setQueue((prevQ) =>
+              prevQ.map((m) =>
+                m.id === msg.data.id
+                  ? { ...m, status: msg.data.status, reason: msg.data.reason }
+                  : m
+              )
+            );
+          }
+
+          const hasPending = updatedHistory.some((m) => m.status === "pending");
+          return { ...t, history: updatedHistory, hasPending };
+        })
+      );
+    };
   };
-
-  socket.onerror = (e) => {
-    console.warn(`WS error en ${table.alias}`, e?.message || e);
-  };
-
-  socket.onclose = (evt) => {
-    console.log(`⚠️ Mesa ${table.alias} desconectada (code=${evt.code} reason=${evt.reason})`);
-    setTables((prev) => prev.map((t) => (t.uuid === table.uuid ? { ...t, connected: false } : t)));
-
-    // Si el server indicó cierre definitivo, NO reconectar
-    const reason = (evt.reason || "").toLowerCase();
-    const definitive =
-      evt.code === 4000 ||
-      reason.includes("mesa cerrada por camarero") ||
-      reason.includes("mesa cerrada por falta de camarero") ||
-      reason.includes("no existe");
-
-    if (definitive) {
-      return;
-    }
-
-    // Evitar múltiples timers
-    if (reconnectTimers.current[table.uuid]) return;
-    reconnectTimers.current[table.uuid] = setTimeout(() => {
-      reconnectTimers.current[table.uuid] = null;
-      connectTo(table);
-    }, 5000);
-  };
-
-  socket.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-
-    setTables((prev) =>
-      prev.map((t) => {
-        if (t.uuid !== table.uuid) return t;
-        let updatedHistory = [...t.history];
-
-        if (msg.type === "history") {
-          updatedHistory = msg.data;
-        } else if (msg.type === "message") {
-          updatedHistory.push(msg.data);
-          notify(table.alias, msg.data);
-          setQueue((prevQ) => (prevQ.some((m) => m.id === msg.data.id) ? prevQ : [...prevQ, { ...msg.data, alias: table.alias }]));
-        } else if (msg.type === "confirmation" || msg.type === "cancellation") {
-          updatedHistory = updatedHistory.map((m) =>
-            m.id === msg.data.id ? { ...m, status: msg.data.status, reason: msg.data.reason } : m
-          );
-          setQueue((prevQ) =>
-            prevQ.map((m) => (m.id === msg.data.id ? { ...m, status: msg.data.status, reason: msg.data.reason } : m))
-          );
-        }
-
-        const hasPending = updatedHistory.some((m) => m.status === "pending");
-        return { ...t, history: updatedHistory, hasPending };
-      })
-    );
-  };
-};
-
 
   const confirmOrder = (uuid, id) => {
     sockets.current[uuid]?.send(JSON.stringify({ type: "confirmation", id }));
@@ -125,7 +185,14 @@ const connectTo = (table) => {
       delete sockets.current[uuid];
     }
     const alias = tables.find((t) => t.uuid === uuid)?.alias;
-    setTables((prev) => prev.filter((t) => t.uuid !== uuid));
+    setTables((prev) => {
+      const updated = prev.filter((t) => t.uuid !== uuid);
+      localStorage.setItem(
+        "tables",
+        JSON.stringify(updated.map((t) => ({ uuid: t.uuid, alias: t.alias })))
+      );
+      return updated;
+    });
     setQueue((prev) => prev.filter((m) => m.alias !== alias));
   };
 
@@ -159,18 +226,18 @@ const connectTo = (table) => {
     );
   };
 
-  const sortedTables = [...tables].sort((a, b) => {
-    if (a.hasPending && !b.hasPending) return -1;
-    if (!a.hasPending && b.hasPending) return 1;
-    return 0;
-  });
-
   const getLabel = (action) => {
     if (action === "service") return "Servicio del restaurante";
     if (action === "bill") return "Cuenta";
     if (action === "cancel") return "Cancelado";
     return "";
   };
+
+  const sortedTables = [...tables].sort((a, b) => {
+    if (a.hasPending && !b.hasPending) return -1;
+    if (!a.hasPending && b.hasPending) return 1;
+    return 0;
+  });
 
   return (
     <div className="app-container">
@@ -193,14 +260,18 @@ const connectTo = (table) => {
               <div className="card-header">
                 <h3>
                   {t.alias}
-                  {t.hasPending && <span className="badge">
-                    {t.history.filter((m) => m.status === "pending").length}
-                  </span>}
-                  <span className={`status ${t.connected ? "online" : "offline"}`}>
-                    {t.connected ? "🟢 Conectada" : "🔴 Desconectada"}
-                  </span>
+                  {t.hasPending && (
+                    <span className="badge">
+                      {t.history.filter((m) => m.status === "pending").length}
+                    </span>
+                  )}
                 </h3>
-                <button className="lock-table-btn" onClick={() => closeTable(t.uuid)}>🔒</button>
+                <span className={`status ${t.connected ? "online" : "offline"}`}>
+                  {t.connected ? "🟢 Conectada" : "🔴 Desconectada"}
+                </span>
+                <button className="lock-table-btn" onClick={() => closeTable(t.uuid)}>
+                  🔒
+                </button>
               </div>
 
               <div className="qr-container" onClick={() => setQrModal(t.uuid)}>
@@ -224,9 +295,19 @@ const connectTo = (table) => {
                   </span>
                   <div className="actions">
                     {t.history[t.history.length - 1].status === "pending" ? (
-                      <button onClick={() => confirmOrder(t.uuid, t.history[t.history.length - 1].id)}>✅</button>
+                      <button
+                        onClick={() =>
+                          confirmOrder(t.uuid, t.history[t.history.length - 1].id)
+                        }
+                      >
+                        ✅
+                      </button>
                     ) : (
-                      <b>{t.history[t.history.length - 1].status === "confirmed" ? "realizado" : t.history[t.history.length - 1].status}</b>
+                      <b>
+                        {t.history[t.history.length - 1].status === "confirmed"
+                          ? "realizado"
+                          : t.history[t.history.length - 1].status}
+                      </b>
                     )}
                   </div>
                 </div>
@@ -257,7 +338,9 @@ const connectTo = (table) => {
               includeMargin={true}
             />
             <p>{`${APP_URL}/join/${qrModal}`}</p>
-            <button className="close-btn" onClick={() => setQrModal(null)}>Cerrar</button>
+            <button className="close-btn" onClick={() => setQrModal(null)}>
+              Cerrar
+            </button>
           </div>
         </div>
       )}
